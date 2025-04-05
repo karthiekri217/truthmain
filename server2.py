@@ -1,6 +1,5 @@
 import io
 import os
-import re
 import time
 import json
 import difflib
@@ -23,49 +22,48 @@ import sys
 # Import EnsembleModel
 from models import EnsembleModel
 
-# Monkey-patch to load model safely in cloud environments
+# Monkey-patch for safe model loading
 import models
 sys.modules['__main__'] = models
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask + Socket.IO initialization
+# Flask + Socket.IO
 app = Flask(__name__, static_folder='static', template_folder='templates')
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'secret!')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# Paths to saved models
+# Model paths
 MODEL_PATH = os.path.join('saved_models', 'ensemble_model.pkl')
 PIPELINE_PATH = os.path.join('saved_models', 'pipeline.pkl')
 
-# Verify model and pipeline existence
+# Verify models exist
 if not os.path.exists(MODEL_PATH) or not os.path.exists(PIPELINE_PATH):
     raise FileNotFoundError("Model or pipeline not found. Please train and save them first.")
 
-# Load model and pipeline
+# Load models
 ensemble_model = joblib.load(MODEL_PATH)
 pipeline = joblib.load(PIPELINE_PATH)
 
-# AssemblyAI configuration
+# AssemblyAI
 aai.settings.api_key = os.getenv('ASSEMBLYAI_API_KEY')
 if not aai.settings.api_key:
     raise ValueError("ASSEMBLYAI_API_KEY is not set in environment variables")
-
 transcriber = aai.Transcriber(config=aai.TranscriptionConfig(language_code="en"))
 
-# Paths to executables
+# Executables
 YT_DLP_PATH = shutil.which("yt-dlp") or os.path.join(os.getcwd(), "yt-dlp.exe")
 FFMPEG_PATH = shutil.which("ffmpeg") or os.path.join(os.getcwd(), "ffmpeg.exe")
 
 if not os.path.exists(YT_DLP_PATH):
-    raise FileNotFoundError(f"yt-dlp not found at {YT_DLP_PATH}. Please install it or update the path.")
+    raise FileNotFoundError(f"yt-dlp not found at {YT_DLP_PATH}. Please install or update the path.")
 if not os.path.exists(FFMPEG_PATH):
-    raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}. Please install it or update the path.")
+    raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}. Please install or update the path.")
 
 # Cache manager
 class CacheManager:
@@ -162,43 +160,48 @@ def fetch_gnews_articles():
         logger.error(f'GNews API error: {e}')
         return []
 
-def fetch_trending_news(retries=3):
+def fetch_trending_news():
     cached_news = cache_manager.get('news', 'trending')
     if cached_news:
         return cached_news
-    try:
-        rss_results = []
-        for source in NEWS_SOURCES['RSS_FEEDS']:
-            feed = feedparser.parse(source['url'])
-            for item in feed.entries[:10]:
-                rss_results.append({
-                    'title': item.title,
-                    'description': item.get('description', item.get('summary', '')),
-                    'url': item.link,
-                    'source': source['name'],
-                    'reliability': source['reliability'],
-                    'published': item.get('published', '')
-                })
-        gnews_results = fetch_gnews_articles()
-        all_news = rss_results + gnews_results
-        unique_news = []
-        for current in all_news:
-            is_duplicate = any(difflib.SequenceMatcher(None, item['title'], current['title']).ratio() > 0.8 for item in unique_news)
-            if not is_duplicate:
-                text = f"{current['title']} {current.get('description', '')}"
-                analysis = analyze_text(text)
-                unique_news.append({**current, 'analysis': analysis})
-        result = unique_news[:15]
-        cache_manager.set('news', 'trending', result)
-        return result
-    except Exception as e:
-        logger.error(f'Error fetching trending news: {e}')
-        if retries > 0:
-            time.sleep(2)
-            return fetch_trending_news(retries=retries-1)
-        return []
 
-# Upload audio buffer
+    retries = 3
+    for attempt in range(retries):
+        try:
+            rss_results = []
+            for source in NEWS_SOURCES['RSS_FEEDS']:
+                feed = feedparser.parse(source['url'])
+                for item in feed.entries[:10]:
+                    rss_results.append({
+                        'title': item.title,
+                        'description': item.get('description', item.get('summary', '')),
+                        'url': item.link,
+                        'source': source['name'],
+                        'reliability': source['reliability'],
+                        'published': item.get('published', '')
+                    })
+            gnews_results = fetch_gnews_articles()
+            all_news = rss_results + gnews_results
+            unique_news = []
+            for current in all_news:
+                is_duplicate = any(difflib.SequenceMatcher(None, item['title'], current['title']).ratio() > 0.8 for item in unique_news)
+                if not is_duplicate:
+                    text = f"{current['title']} {current.get('description', '')}"
+                    analysis = analyze_text(text)
+                    unique_news.append({**current, 'analysis': analysis})
+
+            result = unique_news[:15]
+            cache_manager.set('news', 'trending', result)
+            return result
+
+        except Exception as e:
+            logger.error(f'Attempt {attempt + 1} failed to fetch trending news: {e}')
+            time.sleep(2)
+
+    logger.error('Failed to fetch trending news after retries.')
+    return []
+
+# Upload audio to AssemblyAI
 def upload_audio_buffer(audio_buffer):
     upload_endpoint = "https://api.assemblyai.com/v2/upload"
     headers = {"authorization": aai.settings.api_key}
@@ -207,63 +210,12 @@ def upload_audio_buffer(audio_buffer):
     response.raise_for_status()
     return response.json()['upload_url']
 
-# Transcribe recorded video
+# Transcribe recorded video (disabled temporarily due to YouTube bot detection)
 @app.route('/api/transcribe-recorded', methods=['POST'])
 def transcribe_recorded_route():
-    data = request.get_json()
-    video_url = data.get('video_url')
-    if not video_url:
-        return jsonify({"error": "Video URL is required"}), 400
+    return jsonify({"error": "YouTube download is disabled temporarily to avoid bot detection. Please configure cookies in yt-dlp."}), 503
 
-    max_retries = 3
-    retry_delay = 5
-
-    for attempt in range(max_retries):
-        try:
-            logger.info(f"Extracting audio from {video_url} (Attempt {attempt + 1}/{max_retries})")
-            process = subprocess.Popen(
-                [YT_DLP_PATH, '-x', '--audio-format', 'mp3', '--output', '-', '--no-playlist', video_url],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            audio_data, error = process.communicate(timeout=120)
-            if process.returncode != 0:
-                raise Exception(f'yt-dlp failed: {error.decode()}')
-
-            audio_buffer = io.BytesIO(audio_data)
-            cache_key = f"recorded_{int(time.time() * 1000)}"
-            cache_manager.set('audio', cache_key, audio_buffer, ttl=60)
-
-            cached_audio = cache_manager.get('audio', cache_key)
-            if not cached_audio:
-                raise Exception("Failed to retrieve audio from cache")
-
-            upload_url = upload_audio_buffer(cached_audio)
-            transcript = transcriber.transcribe(upload_url)
-            if transcript.error:
-                raise Exception(f"Transcription error: {transcript.error}")
-            if not transcript.text:
-                raise Exception("Transcription returned empty text")
-
-            cache_manager.delete('audio', cache_key)
-            analysis = analyze_text(transcript.text)
-
-            return jsonify({'text': transcript.text, 'analysis': analysis, 'success': True})
-
-        except subprocess.TimeoutExpired:
-            process.terminate()
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            return jsonify({"error": "Transcription timed out"}), 500
-        except Exception as e:
-            logger.error(f'Transcription error: {e}')
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
-
-# Main routes
+# Routes
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -318,8 +270,7 @@ def handle_disconnect():
         del active_streams[sid]
     logger.info('Client disconnected')
 
-# If you have live stream functions, include them here...
-
+# Main entry
 if __name__ == '__main__':
     PORT = int(os.getenv('PORT', 3000))
     socketio.run(app, host='0.0.0.0', port=PORT)
