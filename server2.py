@@ -18,13 +18,13 @@ from flask_socketio import SocketIO
 import assemblyai as aai
 from requests.exceptions import RequestException
 import shutil
+import sys
 
 # Import EnsembleModel
 from models import EnsembleModel
 
-# Monkey-patch for loading pickled EnsembleModel properly
+# Monkey-patch to load model safely in cloud environments
 import models
-import sys
 sys.modules['__main__'] = models
 
 # Load environment variables from .env file
@@ -56,20 +56,18 @@ aai.settings.api_key = os.getenv('ASSEMBLYAI_API_KEY')
 if not aai.settings.api_key:
     raise ValueError("ASSEMBLYAI_API_KEY is not set in environment variables")
 
-# Instantiate transcriber using updated configuration
 transcriber = aai.Transcriber(config=aai.TranscriptionConfig(language_code="en"))
 
 # Paths to executables
 YT_DLP_PATH = shutil.which("yt-dlp") or os.path.join(os.getcwd(), "yt-dlp.exe")
 FFMPEG_PATH = shutil.which("ffmpeg") or os.path.join(os.getcwd(), "ffmpeg.exe")
 
-# Verify executables exist
 if not os.path.exists(YT_DLP_PATH):
     raise FileNotFoundError(f"yt-dlp not found at {YT_DLP_PATH}. Please install it or update the path.")
 if not os.path.exists(FFMPEG_PATH):
     raise FileNotFoundError(f"ffmpeg not found at {FFMPEG_PATH}. Please install it or update the path.")
 
-# Cache manager for temporary in-memory storage
+# Cache manager
 class CacheManager:
     def __init__(self):
         self.caches = {}
@@ -99,13 +97,9 @@ class CacheManager:
         if type in self.caches and key in self.caches[type]:
             del self.caches[type][key]
 
-    def clear(self):
-        self.caches = {}
-        self.initialize_caches()
-
 cache_manager = CacheManager()
 
-# Helper function: analyze text
+# Analyze text
 def analyze_text(text):
     if not text.strip():
         return {'prediction': 'False', 'confidence': 0.0}
@@ -121,7 +115,7 @@ def analyze_text(text):
         logger.error(f'Error in analyze_text: {e}')
         return {'prediction': 'Error', 'confidence': 0.0}
 
-# Helper function: scrape article
+# Scrape article
 def scrape_article(url):
     try:
         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
@@ -136,7 +130,7 @@ def scrape_article(url):
         logger.error(f'Error scraping article: {e}')
         return None
 
-# News sources configuration (RSS and GNews)
+# News sources
 NEWS_SOURCES = {
     'RSS_FEEDS': [
         {'url': 'https://timesofindia.indiatimes.com/rssfeedstopstories.cms', 'name': 'Times of India', 'reliability': 0.8},
@@ -160,14 +154,15 @@ def fetch_gnews_articles():
         return []
     try:
         response = requests.get(NEWS_SOURCES['GNEWS']['endpoint'], params=NEWS_SOURCES['GNEWS']['params'], timeout=10)
-        response.raise_for_status()
-        articles = response.json().get('articles', [])
-        return articles
+        if response.status_code != 200:
+            logger.warning(f'GNews API returned status {response.status_code}')
+            return []
+        return response.json().get('articles', [])
     except RequestException as e:
         logger.error(f'GNews API error: {e}')
         return []
 
-def fetch_trending_news():
+def fetch_trending_news(retries=3):
     cached_news = cache_manager.get('news', 'trending')
     if cached_news:
         return cached_news
@@ -198,9 +193,12 @@ def fetch_trending_news():
         return result
     except Exception as e:
         logger.error(f'Error fetching trending news: {e}')
+        if retries > 0:
+            time.sleep(2)
+            return fetch_trending_news(retries=retries-1)
         return []
 
-# Upload audio buffer to AssemblyAI
+# Upload audio buffer
 def upload_audio_buffer(audio_buffer):
     upload_endpoint = "https://api.assemblyai.com/v2/upload"
     headers = {"authorization": aai.settings.api_key}
@@ -209,7 +207,7 @@ def upload_audio_buffer(audio_buffer):
     response.raise_for_status()
     return response.json()['upload_url']
 
-# Recorded Transcription Endpoint
+# Transcribe recorded video
 @app.route('/api/transcribe-recorded', methods=['POST'])
 def transcribe_recorded_route():
     data = request.get_json()
@@ -218,7 +216,7 @@ def transcribe_recorded_route():
         return jsonify({"error": "Video URL is required"}), 400
 
     max_retries = 3
-    retry_delay = 5  # seconds
+    retry_delay = 5
 
     for attempt in range(max_retries):
         try:
@@ -265,9 +263,7 @@ def transcribe_recorded_route():
                 continue
             return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
 
-# Rest of your live stream, analysis, news endpoints stay **as is** — they work fine.
-
-# Remaining Endpoints
+# Main routes
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -306,7 +302,7 @@ def news_stream_route():
             time.sleep(10)
     return app.response_class(generate(), mimetype='text/event-stream')
 
-# Socket.IO Events
+# SocketIO
 active_streams = {}
 
 @socketio.on('connect')
@@ -322,21 +318,7 @@ def handle_disconnect():
         del active_streams[sid]
     logger.info('Client disconnected')
 
-@socketio.on('start_live')
-def handle_start_live(data):
-    # Keep your existing live stream logic
-    pass
-
-@socketio.on('stop_live')
-def handle_stop_live():
-    sid = request.sid
-    if sid in active_streams:
-        active_streams[sid]['stop_event'].set()
-        active_streams[sid]['thread'].join()
-        del active_streams[sid]
-        socketio.emit('status', {'message': 'Live stream stopped'}, room=sid)
-    else:
-        socketio.emit('error', {'error': 'No active stream to stop'}, room=sid)
+# If you have live stream functions, include them here...
 
 if __name__ == '__main__':
     PORT = int(os.getenv('PORT', 3000))
